@@ -1,0 +1,4 @@
+PyQt6>=6.4
+Pillow>=9.1
+# Opsional tapi sangat disarankan: hapus background jadi jauh lebih cepat
+numpy>=1.21

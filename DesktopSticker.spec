@@ -1,4 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
+# One build, two outputs:
+#   dist/DesktopSticker/              onedir app used by the installer (fast start, no temp extraction)
+#   dist/DesktopSticker_Portable.exe  single-file portable version
 
 
 a = Analysis(
@@ -16,19 +19,12 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    name='DesktopSticker',
+common = dict(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    # UPX is known to corrupt Qt DLLs, so never compress even if UPX gets installed
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -36,4 +32,34 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['app_icon.ico'],
+)
+
+# --- Onedir (installer) ---
+exe_dir = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='DesktopSticker',
+    **common,
+)
+coll = COLLECT(
+    exe_dir,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name='DesktopSticker',
+)
+
+# --- Onefile (portable) ---
+exe_portable = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name='DesktopSticker_Portable',
+    runtime_tmpdir=None,
+    **common,
 )

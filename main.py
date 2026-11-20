@@ -1,11 +1,20 @@
 import sys
 import os
+import json
 import ctypes
+import traceback
+import faulthandler
+from datetime import datetime
 from PIL import Image, ImageDraw, ImageSequence
 from PyQt6.QtCore import Qt, QPoint, QSize, QTimer, QThread, pyqtSignal
+
+try:
+    import numpy as np  # Optional: makes background removal ~50x faster
+except ImportError:
+    np = None
 from PyQt6.QtGui import QAction, QActionGroup, QCursor, QImage, QPixmap, QIcon
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QMenu, QFileDialog, QVBoxLayout, QInputDialog
+    QApplication, QWidget, QLabel, QMenu, QFileDialog, QVBoxLayout, QInputDialog, QSizePolicy
 )
 
 # Windows Win32 API for enforcing topmost overlay above fullscreen apps & borderless windows
@@ -63,7 +72,173 @@ def get_available_gifs():
     return found
 
 
+# --- Saved state (positions & settings of every sticker) ---
+STATE_VERSION = 1
+
+
+def get_state_path():
+    """Settings live in %APPDATA%\\DesktopSticker (the install folder may be read-only)."""
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "DesktopSticker", "stickers.json")
+
+
+_error_log_file = None  # kept open: faulthandler writes to it on a native crash
+
+
+def install_error_logging():
+    """Logs errors to %APPDATA%\\DesktopSticker\\error.log.
+
+    Under pyw/the .exe there is no console, so errors used to be invisible. Also, by
+    default PyQt6 aborts the WHOLE app on any unhandled Python error in a slot (every
+    sticker vanished at once); with our own excepthook the error is logged and the
+    stickers keep running.
+    """
+    global _error_log_file
+    log_path = os.path.join(os.path.dirname(get_state_path()), "error.log")
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        if os.path.exists(log_path) and os.path.getsize(log_path) > 512 * 1024:
+            os.replace(log_path, log_path + ".old")  # keep the log small
+        _error_log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(_error_log_file)  # native crashes (segfault/abort)
+    except OSError:
+        _error_log_file = None
+
+    def excepthook(exc_type, exc, tb):
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        if _error_log_file is not None:
+            try:
+                _error_log_file.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] {text}")
+            except (OSError, ValueError):
+                pass
+        if sys.__stderr__ is not None:
+            sys.__stderr__.write(text)
+
+    sys.excepthook = excepthook
+
+
+def log_event(message):
+    """Writes an informational line to error.log (e.g. why the app quit)."""
+    if _error_log_file is not None:
+        try:
+            _error_log_file.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] INFO {message}\n")
+        except (OSError, ValueError):
+            pass
+
+
+def quit_app(reason):
+    """The only intended way to quit: logs why, then quits."""
+    app = QApplication.instance()
+    if app is not None:
+        app.quit_reason = reason
+        app.quit()
+
+
+def load_state():
+    """Returns the list of saved sticker dicts, or [] if missing/corrupt."""
+    try:
+        # utf-8-sig: also accept a file saved with a BOM (e.g. edited by hand in an editor)
+        with open(get_state_path(), "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        stickers = data.get("stickers", []) if isinstance(data, dict) else []
+        return [s for s in stickers if isinstance(s, dict)]
+    except (OSError, ValueError):
+        return []
+
+
+def save_state(stickers):
+    """Writes all stickers to disk atomically. An empty list is never written, so
+    the last layout survives the app closing."""
+    states = []
+    for s in stickers:
+        try:
+            states.append(s.to_state())
+        except RuntimeError:  # underlying Qt widget already deleted
+            pass
+    if not states:
+        return
+    path = get_state_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"version": STATE_VERSION, "stickers": states}, fh, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def request_save():
+    """Schedules a save shortly after the last change (debounced)."""
+    app = QApplication.instance()
+    timer = getattr(app, "save_timer", None) if app else None
+    if timer is not None and not getattr(app, "final_state_saved", False):
+        timer.start()
+
+
+def resolve_gif_path(path, name, available):
+    """Finds a saved GIF again: same path, else same file name among the bundled/local GIFs
+    (the bundled folder of the .exe is a new temp folder on every launch)."""
+    if path and os.path.exists(path):
+        return path
+    if name and name in available:
+        return available[name]
+    return None
+
+
+def _num(value, default, lo, hi, cast=float):
+    """Reads a number from saved state, falling back to `default` if invalid."""
+    try:
+        v = cast(value)
+    except (TypeError, ValueError):
+        return default
+    return min(hi, max(lo, v))
+
+
+def _grow_along_rows(region, cand):
+    """Expands `region` to cover every horizontal run of `cand` pixels it touches."""
+    h, w = cand.shape
+    flat = cand.ravel()
+    starts = flat.copy()
+    starts[1:] &= ~flat[:-1]
+    starts[::w] = flat[::w]  # every row begins a new run
+    run_id = np.cumsum(starts) * flat  # 0 = not a candidate pixel
+    hit = np.zeros(int(run_id.max()) + 1, dtype=bool)
+    hit[run_id[region.ravel() & flat]] = True
+    hit[0] = False
+    return hit[run_id].reshape(h, w)
+
+
+def flood_clear(img, pt, tol):
+    """Makes the 4-connected area around `pt` (colour distance <= tol) fully transparent.
+
+    Same result as ImageDraw.floodfill(img, pt, (0, 0, 0, 0), thresh=tol), but vectorised
+    with numpy when available (Pillow's floodfill is a slow pure-Python loop).
+    """
+    if np is None:
+        ImageDraw.floodfill(img, pt, (0, 0, 0, 0), thresh=tol)
+        return img
+
+    x, y = pt
+    arr = np.array(img, dtype=np.int16)
+    seed = arr[y, x].copy()
+    if int(np.abs(seed).sum()) <= tol:  # seed already looks like the fill colour
+        return img
+    cand = np.abs(arr - seed).sum(axis=2) <= tol
+    region = np.zeros_like(cand)
+    region[y, x] = True
+    while True:
+        grown = _grow_along_rows(region, cand)
+        grown = _grow_along_rows(np.ascontiguousarray(grown.T), np.ascontiguousarray(cand.T)).T
+        if np.array_equal(grown, region):
+            break
+        region = grown
+    arr[region] = 0
+    return Image.fromarray(arr.astype(np.uint8), "RGBA")
+
+
 class GifLoaderWorker(QThread):
+    # Emits QImage (not QPixmap): QPixmap must only be created in the GUI thread.
     finished_loading = pyqtSignal(list, list, QSize)
     error_loading = pyqtSignal(str)
 
@@ -72,6 +247,11 @@ class GifLoaderWorker(QThread):
         self.file_path = file_path
         self.bg_mode = bg_mode
         self.bg_tolerance = bg_tolerance
+        self._cancelled = False
+
+    def cancel(self):
+        """Asks the worker to stop at the next frame (safe alternative to terminate())."""
+        self._cancelled = True
 
     def run(self):
         try:
@@ -80,23 +260,30 @@ class GifLoaderWorker(QThread):
                 return
 
             im = Image.open(self.file_path)
-            qpixmaps = []
+            qimages = []
             delays = []
 
-            # Extract base frame dimensions (capped at 240px for desktop performance)
+            # Limit max processing dimension to 240px for huge GIFs (prevents RAM spikes)
             orig_w, orig_h = im.size
             max_dim = max(orig_w, orig_h)
-            factor = min(2.5, max(1.0, 180.0 / max_dim))
-            base_size = QSize(int(orig_w * factor), int(orig_h * factor))
-
-            # Limit max processing dimension to 240px for huge GIFs (prevents RAM spikes)
             target_scale_size = None
-            if orig_w > 240 or orig_h > 240:
+            proc_w, proc_h = orig_w, orig_h
+            if max_dim > 240:
                 scale_ratio = 240.0 / max_dim
-                target_scale_size = (int(orig_w * scale_ratio), int(orig_h * scale_ratio))
+                proc_w = max(1, int(orig_w * scale_ratio))
+                proc_h = max(1, int(orig_h * scale_ratio))
+                target_scale_size = (proc_w, proc_h)
+
+            # Default on-screen size is based on the processed frames, so big GIFs
+            # are not stretched (blurry) beyond the 240px they were rendered at.
+            # Small GIFs are still upscaled to ~180px so they remain visible.
+            factor = min(2.5, max(1.0, 180.0 / max(proc_w, proc_h)))
+            base_size = QSize(int(proc_w * factor), int(proc_h * factor))
 
             frame_idx = 0
             for frame in ImageSequence.Iterator(im):
+                if self._cancelled:
+                    return
                 frame_idx += 1
                 if frame_idx > 300:  # Safety cap for infinite loops
                     break
@@ -118,8 +305,21 @@ class GifLoaderWorker(QThread):
 
                     if not (self.bg_mode == "auto" and already_transparent):
                         tol = self.bg_tolerance
+                        auto_seeds = None
+                        if self.bg_mode == "auto":
+                            # A solid background touches several corners with the same colour.
+                            # A corner unlike all the others is usually the character itself, and
+                            # four different corners mean a scene/photo background: leave those alone.
+                            colors = {pt: f.getpixel(pt) for pt in corners}
+                            auto_seeds = {
+                                pt for pt in corners
+                                if any(q != pt and sum(abs(a - b) for a, b in zip(colors[pt], colors[q])) <= tol
+                                       for q in corners)
+                            }
                         # Flood fill from each of the 4 corners
                         for pt in corners:
+                            if auto_seeds is not None and pt not in auto_seeds:
+                                continue
                             pix = f.getpixel(pt)
                             if pix[3] > 0:  # If pixel is opaque
                                 should_fill = True
@@ -131,19 +331,21 @@ class GifLoaderWorker(QThread):
                                     should_fill = (pix[1] > 180 and pix[0] < 100 and pix[2] < 100)
 
                                 if should_fill:
-                                    ImageDraw.floodfill(f, pt, (0, 0, 0, 0), thresh=tol)
+                                    f = flood_clear(f, pt, tol)
 
-                # Convert PIL RGBA image directly to QPixmap
+                # Convert PIL RGBA image to QImage (converted to QPixmap in the GUI thread)
                 raw_bytes = f.tobytes("raw", "RGBA")
                 qimg = QImage(raw_bytes, w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
-                qpixmaps.append(QPixmap.fromImage(qimg))
+                qimages.append(qimg)
 
                 # Extract frame duration
                 d = frame.info.get("duration", im.info.get("duration", 80))
                 delays.append(d if d and d > 10 else 80)
 
-            if qpixmaps:
-                self.finished_loading.emit(qpixmaps, delays, base_size)
+            if self._cancelled:
+                return
+            if qimages:
+                self.finished_loading.emit(qimages, delays, base_size)
             else:
                 self.error_loading.emit("Tidak ada frame yang dapat dibaca.")
 
@@ -152,25 +354,30 @@ class GifLoaderWorker(QThread):
 
 
 class StickerWidget(QWidget):
-    def __init__(self, gif_path=None, parent=None):
+    def __init__(self, gif_path=None, parent=None, bg_mode="auto", bg_tolerance=35,
+                 fps_mode="default", target_fps=30, speed_multiplier=1.0,
+                 scale=1.0, opacity=1.0, locked=False, always_on_top=True):
         super().__init__(parent)
-        
+        # Free the widget (and its timers/threads) when "Tutup Stiker Ini" is used
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+
         self.gif_path = gif_path
         self.drag_position = QPoint()
-        self.is_locked = False
-        self.is_always_on_top = True
-        self.current_scale = 1.0
+        self.is_locked = locked
+        self.is_always_on_top = always_on_top
+        self.current_scale = scale
         self.base_size = QSize(160, 160)
+        self._keep_scale_on_load = False
 
         # Background transparency settings
         # Modes: "auto" (default), "white", "black", "green", "none"
-        self.bg_mode = "auto"
-        self.bg_tolerance = 35
+        self.bg_mode = bg_mode
+        self.bg_tolerance = bg_tolerance
 
         # FPS & Speed playback settings
-        self.fps_mode = "default"        # "default" or "fixed"
-        self.target_fps = 30             # target fps when in "fixed" mode
-        self.speed_multiplier = 1.0      # speed multiplier (0.25x - 3.0x)
+        self.fps_mode = fps_mode                  # "default" or "fixed"
+        self.target_fps = target_fps              # target fps when in "fixed" mode
+        self.speed_multiplier = speed_multiplier  # speed multiplier (0.25x - 3.0x)
 
         # Animation state
         self.frames = []
@@ -190,44 +397,134 @@ class StickerWidget(QWidget):
         self.loader_thread = None
 
         self.init_ui()
+        self.setWindowOpacity(opacity)
+
+    @classmethod
+    def from_state(cls, state, available, fallback_gif=None):
+        """Recreates a sticker from a dict produced by to_state()."""
+        gif = resolve_gif_path(state.get("gif_path"), state.get("gif_name"), available)
+        bg_mode = state.get("bg_mode")
+        fps_mode = state.get("fps_mode")
+        sticker = cls(
+            gif_path=gif or fallback_gif,
+            bg_mode=bg_mode if bg_mode in ("auto", "white", "black", "green", "none") else "auto",
+            bg_tolerance=_num(state.get("bg_tolerance"), 35, 0, 255, int),
+            fps_mode=fps_mode if fps_mode in ("default", "fixed") else "default",
+            target_fps=_num(state.get("target_fps"), 30, 1, 120, int),
+            speed_multiplier=_num(state.get("speed_multiplier"), 1.0, 0.25, 3.0),
+            scale=_num(state.get("scale"), 1.0, 0.25, 5.0) if gif else 1.0,
+            opacity=_num(state.get("opacity"), 1.0, 0.1, 1.0),
+            locked=bool(state.get("locked", False)),
+            always_on_top=bool(state.get("always_on_top", True)),
+        )
+        x, y = state.get("x"), state.get("y")
+        if isinstance(x, int) and isinstance(y, int):
+            sticker.move(x, y)
+        return sticker
+
+    def to_state(self):
+        """Everything needed to bring this sticker back after a restart."""
+        return {
+            "gif_path": self.gif_path,
+            "gif_name": os.path.basename(self.gif_path) if self.gif_path else None,
+            "x": self.x(),
+            "y": self.y(),
+            "scale": round(self.current_scale, 4),
+            "bg_mode": self.bg_mode,
+            "bg_tolerance": self.bg_tolerance,
+            "fps_mode": self.fps_mode,
+            "target_fps": self.target_fps,
+            "speed_multiplier": self.speed_multiplier,
+            "opacity": round(self.windowOpacity(), 2),
+            "locked": self.is_locked,
+            "always_on_top": self.is_always_on_top,
+        }
 
     def init_ui(self):
         # Window attributes for transparent background & borderless floating window
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool
-        )
+        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+        if self.is_always_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAcceptDrops(True)
 
-        # Layout & Label for the GIF
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(0, 0, 0, 0)
-        self.layout.setSpacing(0)
+        # Layout & Label for the GIF (named main_layout to avoid shadowing QWidget.layout())
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(0)
 
         self.label = QLabel(self)
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setScaledContents(True)
-        self.layout.addWidget(self.label)
+        # A QLabel holding a pixmap reports the pixmap's pixel size as its minimum size,
+        # and the layout then refuses to make the window any smaller (scroll-to-shrink
+        # stopped at the GIF's native size). Ignore it so apply_size() alone decides.
+        self.label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.label.setMinimumSize(1, 1)
+        self.main_layout.addWidget(self.label)
 
         if self.gif_path and os.path.exists(self.gif_path):
-            self.load_gif(self.gif_path)
+            # keep_scale: a restored sticker comes back at its saved zoom
+            self.load_gif(self.gif_path, keep_scale=True)
         else:
             self.label.setText("Drop GIF di sini\natau Klik Kanan")
             self.label.setStyleSheet("color: white; background: rgba(30,30,40,200); border-radius: 10px; padding: 12px;")
             self.resize(180, 80)
 
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setCursor(Qt.CursorShape.ArrowCursor if self.is_locked else Qt.CursorShape.PointingHandCursor)
         self.enforce_topmost()
 
     def showEvent(self, event):
         super().showEvent(event)
         self.enforce_topmost()
 
+    def close_by_user(self):
+        """'Tutup Stiker Ini': removes just this sticker from the saved layout."""
+        self._user_closing = True
+        self.close()
+
+    def closeEvent(self, event):
+        """Stops timers and background loading so a closed sticker uses no CPU/RAM."""
+        app = QApplication.instance()
+        stickers = getattr(app, "stickers", None)
+        if stickers is not None and self in stickers:
+            if getattr(self, "_user_closing", False):
+                if len(stickers) == 1:
+                    # Closing the last sticker quits the app: remember it so it comes back
+                    save_state(stickers)
+                    app.final_state_saved = True
+                stickers.remove(self)
+                if stickers:
+                    request_save()
+                else:
+                    # Last sticker closed: quit explicitly (Qt's automatic
+                    # quit-on-last-window is disabled, see main()).
+                    QTimer.singleShot(0, lambda: quit_app("stiker terakhir ditutup"))
+            elif not getattr(app, "final_state_saved", False):
+                # Qt 6 closes every window when the app quits ("Tutup Semua & Keluar",
+                # Windows logoff). Save the whole layout once, while all stickers still exist.
+                save_state(stickers)
+                app.final_state_saved = True
+        self.shutdown()
+        super().closeEvent(event)
+
+    def shutdown(self):
+        """Stops animation/topmost timers and waits for all loader threads to finish."""
+        self.anim_timer.stop()
+        self.topmost_timer.stop()
+        self.loader_thread = None
+        for worker in self.findChildren(GifLoaderWorker):
+            worker.cancel()
+        for worker in self.findChildren(GifLoaderWorker):
+            worker.wait()
+
     def enforce_topmost(self):
         """Ensures the floating sticker stays at the very top Z-order, even above fullscreen apps."""
         if not IS_WINDOWS or not self.is_always_on_top or not self.isVisible():
+            return
+        # Don't push the sticker above its own right-click menu or open dialogs
+        if QApplication.activePopupWidget() or QApplication.activeModalWidget():
             return
         try:
             hwnd = int(self.winId())
@@ -241,47 +538,83 @@ class StickerWidget(QWidget):
         except Exception:
             pass
 
-    def load_gif(self, file_path):
-        """Asynchronously loads and processes a GIF file in a background worker thread."""
-        self.gif_path = os.path.abspath(file_path)
-        self.anim_timer.stop()
+    def load_gif(self, file_path, keep_scale=False):
+        """Asynchronously loads and processes a GIF file in a background worker thread.
 
-        # Stop existing loader thread if running
-        if self.loader_thread and self.loader_thread.isRunning():
-            self.loader_thread.terminate()
-            self.loader_thread.wait()
+        keep_scale=True keeps the current zoom (used when only background settings change).
+        """
+        self.gif_path = os.path.abspath(file_path)
+        self._keep_scale_on_load = keep_scale
+
+        # Cancel the previous loader cooperatively (terminate() can deadlock/crash Python).
+        # Its results are ignored because it is no longer self.loader_thread.
+        old = self.loader_thread
+        if old is not None and old.isRunning():
+            old.cancel()
+            old.finished.connect(old.deleteLater)
+        elif old is not None:
+            old.deleteLater()
 
         # Start asynchronous worker
-        self.loader_thread = GifLoaderWorker(
+        worker = GifLoaderWorker(
             self.gif_path,
             bg_mode=self.bg_mode,
             bg_tolerance=self.bg_tolerance,
             parent=self
         )
-        self.loader_thread.finished_loading.connect(self.on_gif_loaded)
-        self.loader_thread.error_loading.connect(self.on_gif_error)
-        self.loader_thread.start()
+        worker.finished_loading.connect(
+            lambda frames, delays, size, w=worker: self.on_gif_loaded(w, frames, delays, size))
+        worker.error_loading.connect(lambda msg, w=worker: self.on_gif_error(w, msg))
+        self.loader_thread = worker
+        worker.start()
+        request_save()
 
-    def on_gif_loaded(self, frames, delays, base_size):
+    def on_gif_loaded(self, worker, images, delays, base_size):
         """Called when background worker finishes loading and processing frames."""
-        self.frames = frames
+        if worker is not self.loader_thread:
+            return  # stale result from a cancelled/replaced loader
+
+        self.anim_timer.stop()
+        self.frames = [QPixmap.fromImage(img) for img in images]
         self.delays = delays
         self.base_size = base_size
         self.frame_idx = 0
-        self.current_scale = 1.0
+        if not self._keep_scale_on_load:
+            self.current_scale = 1.0
 
         self.apply_size()
+        self.keep_on_screen()
         self.label.setStyleSheet("")
+        request_save()  # size/position may have changed
 
         if self.frames:
             self.label.setPixmap(self.frames[0])
             if len(self.frames) > 1:
                 self.anim_timer.start(self.get_current_frame_delay())
 
-    def on_gif_error(self, err_msg):
+    def on_gif_error(self, worker, err_msg):
+        if worker is not self.loader_thread:
+            return
+        self.anim_timer.stop()
+        self.frames = []
+        self.delays = []
+        self.label.clear()
         self.label.setText(f"Gagal memuat:\n{err_msg}")
         self.label.setStyleSheet("color: #ff5555; background: rgba(30,30,40,220); border-radius: 8px; padding: 8px;")
         self.resize(180, 80)
+
+    def keep_on_screen(self):
+        """Moves the sticker back inside the visible screen area if it sticks out."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        geo = screen.availableGeometry()
+        x = min(self.x(), geo.x() + geo.width() - self.width())
+        y = min(self.y(), geo.y() + geo.height() - self.height())
+        x = max(x, geo.x())
+        y = max(y, geo.y())
+        if (x, y) != (self.x(), self.y()):
+            self.move(x, y)
 
     def get_native_fps(self):
         """Calculates approximate native FPS based on average frame delay."""
@@ -309,10 +642,12 @@ class StickerWidget(QWidget):
         self.fps_mode = mode
         if target_fps is not None:
             self.target_fps = target_fps
-            self.speed_multiplier = 1.0  # Reset speed multiplier when picking explicit fixed FPS
+        # Picking "Default" or an explicit FPS resets the speed multiplier to 1.0x
+        self.speed_multiplier = 1.0
         if self.anim_timer.isActive() or len(self.frames) > 1:
             self.anim_timer.stop()
             self.anim_timer.start(self.get_current_frame_delay())
+        request_save()
 
     def set_speed_multiplier(self, multiplier):
         """Sets playback speed multiplier (e.g. 0.5x, 2.0x) and applies immediately."""
@@ -320,6 +655,11 @@ class StickerWidget(QWidget):
         if self.anim_timer.isActive() or len(self.frames) > 1:
             self.anim_timer.stop()
             self.anim_timer.start(self.get_current_frame_delay())
+        request_save()
+
+    def set_opacity(self, value):
+        self.setWindowOpacity(value)
+        request_save()
 
     def prompt_custom_fps(self):
         """Displays dialog for custom target FPS input."""
@@ -401,6 +741,7 @@ class StickerWidget(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.setCursor(Qt.CursorShape.PointingHandCursor if not self.is_locked else Qt.CursorShape.ArrowCursor)
+            request_save()  # remember the new position after a drag
             event.accept()
 
     # --- Mouse Wheel for Zoom / Scaling ---
@@ -410,8 +751,9 @@ class StickerWidget(QWidget):
             self.current_scale = min(5.0, self.current_scale * 1.1)
         elif angle < 0:
             self.current_scale = max(0.25, self.current_scale * 0.9)
-        
+
         self.apply_size()
+        request_save()
         event.accept()
 
     # --- Drag & Drop GIF file onto sticker ---
@@ -575,7 +917,7 @@ class StickerWidget(QWidget):
             current_pct = int(round(self.windowOpacity() * 100))
             if abs(current_pct - pct) < 8:
                 action.setChecked(True)
-            action.triggered.connect(lambda checked, p=pct: self.setWindowOpacity(p / 100.0))
+            action.triggered.connect(lambda checked, p=pct: self.set_opacity(p / 100.0))
             opacity_group.addAction(action)
             opacity_menu.addAction(action)
 
@@ -598,23 +940,23 @@ class StickerWidget(QWidget):
 
         # 9. Close This Sticker
         close_act = menu.addAction("❌ Tutup Stiker Ini")
-        close_act.triggered.connect(self.close)
+        close_act.triggered.connect(self.close_by_user)
 
         # 10. Quit All
         exit_act = menu.addAction("🚪 Tutup Semua & Keluar")
-        exit_act.triggered.connect(QApplication.instance().quit)
+        exit_act.triggered.connect(lambda: quit_app("menu Tutup Semua & Keluar"))
 
         menu.exec(QCursor.pos())
 
     def set_bg_mode(self, mode):
         self.bg_mode = mode
         if self.gif_path:
-            self.load_gif(self.gif_path)
+            self.load_gif(self.gif_path, keep_scale=True)
 
     def set_bg_tolerance(self, tol):
         self.bg_tolerance = tol
         if self.gif_path:
-            self.load_gif(self.gif_path)
+            self.load_gif(self.gif_path, keep_scale=True)
 
     def browse_gif(self):
         file_name, _ = QFileDialog.getOpenFileName(
@@ -627,24 +969,30 @@ class StickerWidget(QWidget):
             self.load_gif(file_name)
 
     def add_new_sticker(self):
-        new_widget = StickerWidget(gif_path=self.gif_path)
-        new_widget.bg_mode = self.bg_mode
-        new_widget.bg_tolerance = self.bg_tolerance
-        new_widget.fps_mode = self.fps_mode
-        new_widget.target_fps = self.target_fps
-        new_widget.speed_multiplier = self.speed_multiplier
+        # Settings go through the constructor so they apply before the GIF starts loading
+        new_widget = StickerWidget(
+            gif_path=self.gif_path,
+            bg_mode=self.bg_mode,
+            bg_tolerance=self.bg_tolerance,
+            fps_mode=self.fps_mode,
+            target_fps=self.target_fps,
+            speed_multiplier=self.speed_multiplier,
+        )
         new_widget.move(self.pos() + QPoint(50, 50))
         new_widget.show()
         if not hasattr(QApplication.instance(), "stickers"):
             QApplication.instance().stickers = []
         QApplication.instance().stickers.append(new_widget)
+        request_save()
 
     def toggle_lock(self):
         self.is_locked = not self.is_locked
         self.setCursor(Qt.CursorShape.ArrowCursor if self.is_locked else Qt.CursorShape.PointingHandCursor)
+        request_save()
 
     def toggle_always_on_top(self):
         self.is_always_on_top = not self.is_always_on_top
+        request_save()
         flags = self.windowFlags()
         if self.is_always_on_top:
             flags |= Qt.WindowType.WindowStaysOnTopHint
@@ -675,10 +1023,18 @@ class StickerWidget(QWidget):
     def reset_size(self):
         self.current_scale = 1.0
         self.apply_size()
+        request_save()
 
 def main():
+    install_error_logging()
     app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(True)
+    # Never let Qt quit on its own. Stickers are Qt.Tool windows, which Qt does not count
+    # as "real" windows, so closing the "Buka File GIF" dialog looked like the last window
+    # closing and Qt quit the whole app (exit code 0, every sticker gone). The app quits
+    # only through quit_app(): "Tutup Semua & Keluar" or closing the last sticker.
+    app.setQuitOnLastWindowClosed(False)
+    app.quit_reason = None
+    app.lastWindowClosed.connect(lambda: log_event("lastWindowClosed dari Qt diabaikan (aplikasi tetap jalan)"))
 
     # Set Window / Taskbar Icon
     icon_path = get_resource_path("app_icon.ico")
@@ -696,12 +1052,38 @@ def main():
     if not default_gif and available:
         default_gif = next(iter(available.values()))
 
-    sticker = StickerWidget(gif_path=default_gif)
-    app.stickers = [sticker]
+    # On quit, stop every sticker's loader thread first; destroying a running
+    # QThread aborts the process ("QThread: Destroyed while thread is still running").
+    # Also save the final layout ("Tutup Semua & Keluar") so it comes back next launch.
+    def shutdown_all():
+        log_event(f"aplikasi keluar: {app.quit_reason or 'TIDAK DIKETAHUI (bukan dari menu)'}")
+        app.save_timer.stop()
+        if not getattr(app, "final_state_saved", False):
+            save_state(getattr(app, "stickers", []))
+            app.final_state_saved = True
+        for s in list(getattr(app, "stickers", [])):
+            s.shutdown()
+    app.aboutToQuit.connect(shutdown_all)
 
-    screen = app.primaryScreen().geometry()
-    sticker.move(screen.width() - 260, screen.height() - 320)
-    sticker.show()
+    # Debounced auto-save: changes are written ~0.5s after the last one
+    app.save_timer = QTimer()
+    app.save_timer.setSingleShot(True)
+    app.save_timer.setInterval(500)
+    app.save_timer.timeout.connect(lambda: save_state(app.stickers))
+
+    # Restore the stickers from the last session, or start with the default one
+    app.stickers = [StickerWidget.from_state(st, available, default_gif) for st in load_state()]
+    if not app.stickers:
+        sticker = StickerWidget(gif_path=default_gif)
+        # Bottom-right of the usable screen area (respects taskbar & multi-monitor offsets);
+        # keep_on_screen() pulls it back in once the real GIF size is known.
+        geo = app.primaryScreen().availableGeometry()
+        sticker.move(geo.x() + geo.width() - 260, geo.y() + geo.height() - 320)
+        app.stickers = [sticker]
+
+    for s in app.stickers:
+        s.show()
+        s.keep_on_screen()  # e.g. a monitor that was unplugged since last time
 
     sys.exit(app.exec())
 

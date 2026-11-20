@@ -2,7 +2,10 @@
 ; Modern, lightweight installer with desktop shortcut and uninstaller
 
 #define MyAppName "Desktop GIF Sticker"
-#define MyAppVersion "1.0.0"
+; build.bat passes the version with /DMyAppVersion=...; this is the fallback
+#ifndef MyAppVersion
+  #define MyAppVersion "1.1"
+#endif
 #define MyAppPublisher "Desktop Sticker Studio"
 #define MyAppExeName "DesktopSticker.exe"
 
@@ -18,7 +21,10 @@ DisableProgramGroupPage=yes
 ; PrivilegesRequired=lowest enables 1-click install without needing Windows admin prompt
 PrivilegesRequired=lowest
 OutputDir=dist
-OutputBaseFilename=DesktopSticker_Setup_v1.0
+OutputBaseFilename=DesktopSticker_Setup_v{#MyAppVersion}
+VersionInfoVersion={#MyAppVersion}
+; Close a running sticker app before upgrading/uninstalling (the .exe is locked while running)
+CloseApplications=force
 SetupIconFile=app_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/max
@@ -33,9 +39,14 @@ Name: "desktopicon"; Description: "Buat shortcut di Desktop"; GroupDescription: 
 Name: "startupicon"; Description: "Jalankan otomatis saat komputer dinyalakan (Startup)"; GroupDescription: "Opsi Tambahan:"; Flags: unchecked
 
 [Files]
-Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; Onedir build: the exe plus its _internal folder (Python, Qt, GIF assets)
+Source: "dist\DesktopSticker\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "app_icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
+
+[UninstallDelete]
+; Python may create __pycache__ / temp files inside the install folder at runtime
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app_icon.ico"

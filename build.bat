@@ -1,28 +1,49 @@
 @echo off
+setlocal
+cd /d "%~dp0"
+set "VERSION=1.1"
 echo ==============================================
-echo Building Desktop GIF Sticker Binary & Installer
+echo Building Desktop GIF Sticker v%VERSION% - exe + installer
 echo ==============================================
 echo.
+py -c "import PyInstaller, PyQt6, PIL" >nul 2>nul
+if errorlevel 1 (
+    echo Library build belum lengkap. Jalankan dulu:
+    echo     py -m pip install -r requirements.txt pyinstaller
+    pause
+    exit /b 1
+)
+
 echo [1/3] Running PyInstaller...
 py -m PyInstaller DesktopSticker.spec --noconfirm
-if %errorlevel% neq 0 (
+if errorlevel 1 (
     echo PyInstaller build failed!
     pause
-    exit /b %errorlevel%
+    exit /b 1
 )
 echo.
 echo [2/3] Compiling Inno Setup Installer...
 set "ISCC_PATH=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
 if not exist "%ISCC_PATH%" set "ISCC_PATH=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 if not exist "%ISCC_PATH%" set "ISCC_PATH=C:\Program Files\Inno Setup 6\ISCC.exe"
-
-if exist "%ISCC_PATH%" (
-    "%ISCC_PATH%" installer.iss
-) else (
-    echo WARNING: ISCC.exe not found.
+if not exist "%ISCC_PATH%" (
+    echo ERROR: ISCC.exe tidak ditemukan. Install Inno Setup 6 dari https://jrsoftware.org/isdl.php
+    echo dist\DesktopSticker_Portable.exe sudah jadi, tapi installer belum dibuat.
+    pause
+    exit /b 1
+)
+"%ISCC_PATH%" /DMyAppVersion=%VERSION% installer.iss
+if errorlevel 1 (
+    echo Inno Setup build failed!
+    pause
+    exit /b 1
 )
 echo.
 echo [3/3] Updating ZIP distribution...
-powershell -NoProfile -Command "if (Test-Path 'dist\DesktopSticker_Setup_v1.0.exe') { Compress-Archive -Path 'dist\DesktopSticker_Setup_v1.0.exe' -DestinationPath 'dist\DesktopSticker_Setup_v1.0.zip' -Force }"
+powershell -NoProfile -Command "Compress-Archive -Path 'dist\DesktopSticker_Setup_v%VERSION%.exe' -DestinationPath 'dist\DesktopSticker_Setup_v%VERSION%.zip' -Force"
 echo.
-echo Build completed successfully! Output in dist/
+echo Build completed successfully! Output in dist\
+echo   - dist\DesktopSticker_Portable.exe         (portable, 1 file)
+echo   - dist\DesktopSticker_Setup_v%VERSION%.exe (installer)
+echo   - dist\DesktopSticker\                     (isi aplikasi untuk installer)
+pause
